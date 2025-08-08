@@ -15,6 +15,7 @@ load_flag = False  # 是否加载模型
 anner_flag = False  # 是否退火
 episode_num = 1000  # 训练的episode数
 
+#change
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     nn.init.orthogonal_(layer.weight, std) # 权重用正交初始化
     nn.init.constant_(layer.bias, bias_const) # 偏置用常数初始化
