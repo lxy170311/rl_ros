@@ -11,11 +11,8 @@ from torch.distributions import Normal
 
 from realenv import RealEnv
 
-load_flag = False  # 是否加载模型
-anner_flag = False  # 是否退火
-episode_num = 1000  # 训练的episode数
+load_flag = False
 
-#change
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     nn.init.orthogonal_(layer.weight, std) # 权重用正交初始化
     nn.init.constant_(layer.bias, bias_const) # 偏置用常数初始化
@@ -23,47 +20,40 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
 
 # 策略网络actor
 class PolicyNet(nn.Module):
-    def __init__(self, state_dim, hidden_dim, action_dim, action_bound=50):
+    def __init__(self, state_dim, hidden_dim, action_dim, action_bound=2):
         super(PolicyNet, self).__init__()
-        self.actor_mean = nn.Sequential(
-            layer_init(nn.Linear(state_dim, hidden_dim)),
-            nn.ReLU(),
-            layer_init(nn.Linear(hidden_dim, hidden_dim)),
-            nn.ReLU(),
-            # 生成分布期望
-            layer_init(nn.Linear(hidden_dim, action_dim),std=0.01)
-        )
-        # 生成分布标准差
-        self.actor_logstd = nn.Parameter(torch.zeros(1,action_dim))
+        self.fc1 = layer_init(torch.nn.Linear(state_dim, hidden_dim))
+        self.fc2 = layer_init(torch.nn.Linear(hidden_dim, hidden_dim))
+        #生成分布期望
+        self.fc_mu = layer_init(torch.nn.Linear(hidden_dim, action_dim),std = 0.01)
+        #生成分布标准差
+        self.fc_std = nn.Parameter(torch.zeros(action_dim))
         # 动作幅度阈值
         self.action_bound = action_bound
 
-    def get_action(self, x,action = None):
-        mu = self.actor_mean(x)
-        std = self.actor_logstd.expand_as(mu)
-        std = torch.exp(std)
-        dist = Normal(mu, std)
-        if action is None:
-            action = dist.sample()  # 采样动作
-        action = torch.tanh(action)  # 限制动作幅度到[-1,1]
-        action = action * self.action_bound  # 动作幅度阈值
-        return action, dist.log_prob(action).sum(1), dist.entropy().sum(1)
+    def forward(self, x):
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        mu = self.fc_mu(x)
+        std = self.fc_std.expand_as(mu)
+        return mu,std
 
 
 # 价值网络critic
 class ValueNet(nn.Module):
     def __init__(self, n_states, n_hiddens):
         super(ValueNet, self).__init__()
-        self.critic = nn.Sequential(
-            layer_init(nn.Linear(n_states, n_hiddens)),
-            nn.ReLU(),
-            layer_init(nn.Linear(n_hiddens, n_hiddens)),
-            nn.ReLU(),
-            layer_init(nn.Linear(n_hiddens, 1))
-        )
+        self.fc1 = nn.Linear(n_states, n_hiddens)
+        self.fc2 = nn.Linear(n_hiddens, n_hiddens)
+        self.fc3 = nn.Linear(n_hiddens, 1)
 
-    def get_value(self, x):
-        return self.critic(x)
+    def forward(self, x):
+        x = self.fc1(x)  
+        x = F.relu(x)
+        x = self.fc2(x) 
+        x = F.relu(x)
+        x = self.fc3(x)
+        return x
 
 
 # PPO类
@@ -82,10 +72,14 @@ class PPO:
         device,
     ):
         # 实例化actor和critic网络
-        self.pi = PolicyNet(state_dim, hidden_dim, action_dim).to(device)  # 策略网络
-        self.old_pi = PolicyNet(state_dim, hidden_dim, action_dim).to(device)  # 旧策略网络
-        self.v = ValueNet(state_dim, hidden_dim).to(device) #价值网络
-        self.old_v = ValueNet(state_dim, hidden_dim).to(device) #旧价值网络
+        self.pi = PolicyNet(state_dim, hidden_dim, action_dim).to(device)  # 新策略网络
+        self.old_pi = PolicyNet(state_dim, hidden_dim, action_dim).to(
+            device
+        )  # 旧策略网络
+        self.v = ValueNet(state_dim, hidden_dim).to(device)
+        self.old_v = ValueNet(state_dim, hidden_dim).to(
+            device
+        )  # 旧价值网络，计算更新前后差别
 
         if load_flag is True:
             self.load()
@@ -94,6 +88,8 @@ class PPO:
         self.pi_optimizer = optim.Adam(self.pi.parameters(), lr=actor_lr)
         self.v_optimizer = optim.Adam(self.v.parameters(), lr=critic_lr)
 
+        self.actor_lose = 0 #策略网络损失
+        self.critic_lose = 0 #价值网络损失
         self.step = 0  # 更新步数
         self.gamma = gamma  # 折扣因子
         self.lmbda = lmbda  # GAE缩放系数
@@ -101,29 +97,23 @@ class PPO:
         self.eps_clip = eps_clip  # clip参数
         self.device = device
         self.action_bound = 50  # 动作幅度阈值
-        self.actor_loss = 0.0
-        self.critic_loss = 0.0
 
-        self.mini_batch_size = 64  # mini-batch大小
-
-    
-    def annear_lr(self, episode):
-        #lr退火
-        frac = 1.0 - episode / episode_num
-        lr_pi = frac * 3e-4
-        lr_v = frac * 1e-3
-        for param_group in self.pi_optimizer.param_groups:
-            param_group["lr"] = lr_pi
-        for param_group in self.v_optimizer.param_groups:
-            param_group["lr"] = lr_v
-
+    # 选择动作
+    def take_action(self, state):
+        with torch.no_grad():
+            mu, log_std = self.old_pi(state)
+            std = torch.exp(log_std)
+            dist = torch.distributions.normal.Normal(mu, std)  # 构建正态分布
+            action = dist.sample()  # 采样动作
+            action = torch.tanh(action)  # 限制动作幅度到[-1,1]
+        return action.item()*self.action_bound,dist.entropy()
 
     # 更新网络
     def update(self, transitions):
         self.step += 1
         # 提取数据集
         states = torch.tensor(transitions["states"], dtype=torch.float).to(self.device)
-        actions = torch.tensor(transitions["actions"]).to(self.device).view(-1, 1)
+        actions = torch.tensor(transitions["actions"], dtype=torch.float).to(self.device).view(-1, 1)
         rewards = (
             torch.tensor(transitions["rewards"], dtype=torch.float)
             .to(self.device)
@@ -141,21 +131,24 @@ class PPO:
         for _ in range(K_epochs):
             with torch.no_grad():
                 # td目标
-                td_target = rewards + self.gamma * self.old_v.get_value(next_states) * (1 - dones)
+                td_target = rewards + self.gamma * self.old_v(next_states) * (1 - dones)
                 # 计算旧策略分布
-                _, log_old_prob, _ = self.old_pi.get_action(states)
+                mu, log_std = self.old_pi(states)
+                std = torch.exp(log_std)
+                old_dist = torch.distributions.normal.Normal(mu, std)
+                log_old_prob = old_dist.log_prob(actions)
                 # td误差
                 td_error = (
                     rewards
-                    + self.gamma * self.v.get_value(next_states) * (1 - dones)
-                    - self.v.get_value(states)
+                    + self.gamma * self.v(next_states) * (1 - dones)
+                    - self.v(states)
                 )
                 td_error = td_error.detach().numpy()
                 # GAE计算
                 advantage_list = []
                 adv = 0.0
                 for td in td_error[::-1]:
-                    adv = adv * self.gamma * self.lmbda + td
+                    adv = adv * self.gamma * self.lmbda + td[0]
                     advantage_list.append(adv)
                 # 正序
                 advantage_list.reverse()
@@ -164,7 +157,10 @@ class PPO:
                 ).reshape(-1, 1)
 
             # 新策略概率分布
-            _, log_new_prob, entropy = self.pi.get_action(states,actions)
+            mu, log_std = self.pi(states)
+            std = torch.exp(log_std)
+            new_dist = torch.distributions.normal.Normal(mu, std)
+            log_new_prob = new_dist.log_prob(actions)
             ratio = torch.exp(log_new_prob - log_old_prob)  # 新旧概率分布比率
             # ppo目标函数两个子项
             sub1 = ratio * advantage_list
@@ -177,16 +173,14 @@ class PPO:
             self.pi_optimizer.zero_grad()
             loss_pi.backward()
             self.pi_optimizer.step()
-            self.actor_loss = loss_pi.item()
+            self.actor_lose = loss_pi.item()
 
             # 价值网络更新
-            loss_v = torch.mean(F.mse_loss(td_target.detach(), self.v.get_value(states)))
+            loss_v = F.mse_loss(td_target.detach(), self.v(states))
             self.v_optimizer.zero_grad()
             loss_v.backward()
             self.v_optimizer.step()
             self.critic_loss = loss_v.item()
-        
-        
         # 更新两个旧网络参数
         self.old_pi.load_state_dict(self.pi.state_dict())
         self.old_v.load_state_dict(self.v.state_dict())
@@ -222,7 +216,7 @@ def get_reward(is_overturn, state, done):
 if not os.path.exists("./models"):
     os.makedirs("./models")
 
-
+rclpy.init(args=None)
 rate = rclpy.Rate(10)
 file_name = "PPO_model"
 writer = SummaryWriter()
@@ -233,6 +227,7 @@ gamma = 0.99
 lmbda = 0.95
 K_epochs = 8  # 一组训练轨迹的训练次数
 eps_clip = 0.2  # clip参数
+episode = 1000
 
 actor_lr = 3e-4
 critic_lr = 1e-3
@@ -256,7 +251,7 @@ net = PPO(
 )
 
 # 训练
-for i_episode in range(episode_num):
+for i_episode in range(1000):
     # 初始化环境
     state, _ = env.reset()
     done = False
@@ -269,12 +264,10 @@ for i_episode in range(episode_num):
         "rewards": [],
         "dones": [],
     }
-    if anner_flag:
-        net.annear_lr(i_episode)
+
     while not done:
         # 选择动作
-        action,log_prob,entropy = net.pi.get_action(torch.Tensor(state).to(device))
-        action = action.item()
+        action,entropy = net.take_action(torch.tensor([state], dtype=torch.float))
         # 执行动作
         env.action_publish(action)
         rate.sleep()
@@ -294,8 +287,8 @@ for i_episode in range(episode_num):
     return_list.append(episode_reward)
     writer.add_scalar("actor_loss", net.actor_loss, i_episode)
     writer.add_scalar("critic_loss", net.critic_loss, i_episode)
-    writer.add_scalar("entropy", entropy.item(), i_episode)
-    writer.add_scalar("return", episode_reward, i_episode)
+    writer.add_scalar('return', episode_reward, i_episode)
+    writer.add_scalar('entropy', entropy.item(), i_episode)
 
     # 打印回合信息
     print(f"iter:{i_episode}, return:{np.mean(return_list[-10:])}")
